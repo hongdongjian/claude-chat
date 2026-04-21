@@ -7,12 +7,23 @@ export type UserEvent = {
   text: string;
   images?: Array<{ data: string; mimeType: string }>;
 };
-export type AssistantEvent = { kind: "assistant"; id: string; text: string; done: boolean };
-export type ThoughtEvent = { kind: "thought"; id: string; text: string; done: boolean };
+export type AssistantEvent = {
+  kind: "assistant";
+  id: string;
+  text: string;
+  done: boolean;
+};
+export type ThoughtEvent = {
+  kind: "thought";
+  id: string;
+  text: string;
+  done: boolean;
+};
 export type ToolCallEvent = {
   kind: "tool"; id: string; toolCallId: string; call: ToolCallState;
 };
-export type SessionEvent = UserEvent | AssistantEvent | ThoughtEvent | ToolCallEvent;
+export type NoticeEvent = { kind: "notice"; id: string; text: string };
+export type SessionEvent = UserEvent | AssistantEvent | ThoughtEvent | ToolCallEvent | NoticeEvent;
 
 export type ToolCallContentBlock =
   | { type: "content"; text: string }
@@ -66,6 +77,11 @@ export type SessionState = {
   usage: UsageSummary | null;
   loaded: boolean;
   lastActiveAt: number;
+  // Set of text contents the user has actively sent via appendUserMessage in
+  // this session. Used to drop `user_message_chunk` replays of those same
+  // messages (which the CLI emits again when it kicks off a follow-up turn
+  // after a cancel or tool round-trip).
+  sentUserTexts: string[];
 };
 
 type Store = {
@@ -150,7 +166,7 @@ function applyToolCallEvent(cur: SessionState, u: RawUpdate & { content?: unknow
       locations: (u.locations ?? []).map((l) => ({ path: l.path, line: l.line ?? undefined })),
     };
     const ev: ToolCallEvent = { kind: "tool", id: nextId(), toolCallId: id, call };
-    const events = [...cur.events, ev];
+    const events = [...closeTrailingStream(cur.events), ev];
     const toolCallIndex = { ...cur.toolCallIndex, [id]: events.length - 1 };
     return { ...cur, events, toolCallIndex };
   }
@@ -180,11 +196,14 @@ function appendChunk(
   kind: "assistant" | "thought",
   text: string,
 ): SessionState {
-  const events = [...cur.events];
+  let events = [...cur.events];
   const last = events[events.length - 1];
   if (last && last.kind === kind && !last.done) {
     events[events.length - 1] = { ...last, text: last.text + text } as SessionEvent;
   } else {
+    // Switching to a different kind (or starting fresh after a closed stream):
+    // finalize any trailing streaming event so its cursor stops blinking.
+    events = closeTrailingStream(events);
     const ev: AssistantEvent | ThoughtEvent = { kind, id: nextId(), text, done: false };
     events.push(ev);
   }
@@ -205,6 +224,22 @@ const ACP_ENVELOPE_PREFIXES = [
   "<local-command-stderr>",
 ];
 
+// Claude CLI writes these synthetic "user" messages to the transcript when a
+// turn is cancelled via cancel(). They are not real user input — render them
+// as an inline notice instead of a user bubble.
+const INTERRUPT_MARKERS = [
+  "[Request interrupted by user]",
+  "[Request interrupted by user for tool use]",
+];
+
+function matchInterruptMarker(text: string): string | null {
+  const t = text.trim();
+  for (const m of INTERRUPT_MARKERS) {
+    if (t === m) return m;
+  }
+  return null;
+}
+
 function isAcpCommandEnvelope(text: string): boolean {
   const t = text.trim();
   return ACP_ENVELOPE_PREFIXES.some((p) => t.startsWith(p));
@@ -219,13 +254,40 @@ type UserChunkContent =
 
 function appendUserChunk(cur: SessionState, content: UserChunkContent): SessionState {
   if (!content) return cur;
+  // Even during a live turn we still want to surface the cancel marker as an
+  // inline notice — it's the only signal that a cancelled turn actually died.
+  if (content.type === "text") {
+    const liveText = content.text ?? "";
+    const interrupt = matchInterruptMarker(liveText);
+    if (interrupt) {
+      let events = [...cur.events];
+      const last = events[events.length - 1];
+      if (last && last.kind === "notice" && last.text === interrupt) return cur;
+      events = closeTrailingStream(events);
+      events.push({ kind: "notice", id: nextId(), text: interrupt });
+      return { ...cur, events };
+    }
+  }
   // Live turn: ACP echoes what we just sent; UI already has it.
   if (cur.promptRunning) return cur;
   if (content.type === "text") {
     const text = content.text ?? "";
     if (!text) return cur;
     if (isAcpCommandEnvelope(text)) return cur;
-    const events = [...cur.events];
+    // Drop replays of messages the user has already actively sent via
+    // appendUserMessage — the CLI emits these again when kicking off a
+    // follow-up turn (e.g. after a cancelled ask_user).
+    if (cur.sentUserTexts.includes(text)) return cur;
+    const interrupt = matchInterruptMarker(text);
+    if (interrupt) {
+      let events = [...cur.events];
+      const last = events[events.length - 1];
+      if (last && last.kind === "notice" && last.text === interrupt) return cur;
+      events = closeTrailingStream(events);
+      events.push({ kind: "notice", id: nextId(), text: interrupt });
+      return { ...cur, events };
+    }
+    const events = closeTrailingStream([...cur.events]);
     const last = events[events.length - 1];
     if (last && last.kind === "user") {
       if (last.text === text) return cur;
@@ -242,7 +304,7 @@ function appendUserChunk(cur: SessionState, content: UserChunkContent): SessionS
     typeof content.mimeType === "string"
   ) {
     const img = { data: content.data, mimeType: content.mimeType };
-    const events = [...cur.events];
+    const events = closeTrailingStream([...cur.events]);
     const last = events[events.length - 1];
     if (last && last.kind === "user") {
       const images = [...(last.images ?? []), img];
@@ -260,6 +322,22 @@ function markStreamingDone(cur: SessionState): SessionState {
     (e.kind === "assistant" || e.kind === "thought") && !e.done ? { ...e, done: true } : e,
   );
   return { ...cur, events };
+}
+
+// Close out any trailing streaming assistant/thought event. Used whenever
+// we're about to append a new event of a different kind (e.g. the next user
+// message, a new tool call, a notice) — especially during history replay,
+// where we never get an explicit prompt.done to flip the flag.
+function closeTrailingStream(events: SessionEvent[]): SessionEvent[] {
+  const idx = events.length - 1;
+  if (idx < 0) return events;
+  const last = events[idx];
+  if ((last.kind === "assistant" || last.kind === "thought") && !last.done) {
+    const next = events.slice();
+    next[idx] = { ...last, done: true };
+    return next;
+  }
+  return events;
 }
 
 export const useStore = create<Store>((set) => ({
@@ -303,10 +381,18 @@ export const useStore = create<Store>((set) => ({
       const ev: UserEvent = { kind: "user", id: nextId(), text };
       if (images && images.length > 0) ev.images = images;
       const events = [...cur.events, ev];
+      const sentUserTexts = text
+        ? [...cur.sentUserTexts, text]
+        : cur.sentUserTexts;
       return {
         sessions: {
           ...s.sessions,
-          [sessionId]: { ...cur, events, promptRunning: true },
+          [sessionId]: {
+            ...cur,
+            events,
+            promptRunning: true,
+            sentUserTexts,
+          },
         },
       };
     }),
@@ -350,6 +436,7 @@ export const useStore = create<Store>((set) => ({
             usage: null,
             loaded: true,
             lastActiveAt: Date.now(),
+            sentUserTexts: [],
           };
           return {
             sessions: { ...s.sessions, [msg.sessionId]: sess },
@@ -372,6 +459,7 @@ export const useStore = create<Store>((set) => ({
               usage: null,
               loaded: false,
               lastActiveAt: p.lastActiveAt,
+              sentUserTexts: [],
             };
           }
           return { sessions: next };
@@ -398,6 +486,7 @@ export const useStore = create<Store>((set) => ({
               usage: null,
               loaded: false,
               lastActiveAt: Date.now(),
+              sentUserTexts: [],
             };
             next[msg.sessionId] = {
               ...base,

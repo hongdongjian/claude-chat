@@ -3,6 +3,7 @@ import { useStore } from "@/store/sessions";
 import { UserBubble } from "./UserBubble";
 import { AssistantBubble } from "./AssistantBubble";
 import { ThoughtBlock } from "./ThoughtBlock";
+import { NoticeBubble } from "./NoticeBubble";
 import { ToolCallCard } from "@/components/tools/ToolCallCard";
 import { ArrowDown, Loader2 } from "lucide-react";
 
@@ -52,7 +53,8 @@ export function ChatWindow({ sessionId }: { sessionId: string }) {
         style={{ contain: "layout" }}
       >
         <div className="font-mono text-[11px] text-fg-muted">
-          workspace: {session.cwd}
+          <div>workspace: {session.cwd}</div>
+          <div>claude session: {sessionId}</div>
         </div>
         {session.events.length === 0 && !session.loaded && <LoadingSessionIndicator />}
         {session.events.length === 0 && session.loaded && (
@@ -63,6 +65,7 @@ export function ChatWindow({ sessionId }: { sessionId: string }) {
           if (e.kind === "assistant") return <AssistantBubble key={e.id} text={e.text} done={e.done} />;
           if (e.kind === "thought") return <ThoughtBlock key={e.id} text={e.text} done={e.done} />;
           if (e.kind === "tool") return <ToolCallCard key={e.id} call={e.call} />;
+          if (e.kind === "notice") return <NoticeBubble key={e.id} text={e.text} />;
           return null;
         })}
         {session.promptRunning && <RunningIndicator />}

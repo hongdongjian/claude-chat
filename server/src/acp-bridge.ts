@@ -43,8 +43,12 @@ export type AcpBridge = {
 export async function createAcpBridge(handlers: BridgeHandlers): Promise<AcpBridge> {
   const { agentStream, clientStream } = createInMemoryPipe();
 
+  let agent: ClaudeAcpAgent | null = null;
   const agentConn = new AgentSideConnection(
-    (conn) => new ClaudeAcpAgent(conn),
+    (conn) => {
+      agent = new ClaudeAcpAgent(conn);
+      return agent;
+    },
     agentStream,
   );
 
@@ -75,6 +79,15 @@ export async function createAcpBridge(handlers: BridgeHandlers): Promise<AcpBrid
     client,
     dispose: async () => {
       logger.debug("acp bridge disposing");
+      // Tear down all sessions on the agent side first — this cancels
+      // in-flight queries and kills the spawned claude CLI child process.
+      // Without this, closing only the in-memory streams leaves orphan
+      // `claude --resume ...` processes accumulating under the server pid.
+      try {
+        await agent?.dispose();
+      } catch (err) {
+        logger.warn({ err }, "agent.dispose() failed");
+      }
       try {
         await agentStream.writable.close();
       } catch {
